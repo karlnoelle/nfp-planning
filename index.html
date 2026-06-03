@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex" />
+<title>NFP — Natural Feline Planning</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070711; }
+  #root { min-height: 100vh; }
+  #boot { display:flex; align-items:center; justify-content:center; min-height:100vh; color:#9a96c4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; letter-spacing:1px; }
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><div id="boot">waking the cats…</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+/* =======================================================================
+   NFP — NATURAL FELINE PLANNING  ·  self-hosted / Supabase edition
+   =======================================================================
+   STEP 1 — paste your Supabase project URL + anon (public) key below.
+            (Supabase dashboard → Project Settings → API)
+   STEP 2 — run the SQL shown on the setup screen (or in the chat) once.
+   STEP 3 — open this file, or drop it on any static host, and share it.
+   ======================================================================= */
+const SUPABASE_URL = "PASTE_YOUR_SUPABASE_URL_HERE";       // e.g. https://abcd1234.supabase.co
+const SUPABASE_ANON_KEY = "PASTE_YOUR_SUPABASE_ANON_KEY_HERE";
+
+/* ---- the squad + magic keys (hand each key to the right feline) ---- */
+const USERS = [
+  { id: "eeps",  name: "Eeps",                  key: "eeps-zoomies-4f2k",   emoji: "🐈",    accent: "#34e8e0", blurb: "Runs on espresso and undefined behavior." },
+  { id: "zarch", name: "Zarch",                 key: "zarch-vroom-9x7q",    emoji: "🏎️",    accent: "#ff3df0", blurb: "More side projects than parking tickets." },
+  { id: "moog",  name: "Professor Moogenborks", key: "moog-quantum-2v8z",   emoji: "🐈‍⬛",  accent: "#ffc24d", blurb: "Tenured in chaos. Studies the cosmos one nap at a time." },
+  { id: "nat",   name: "Nat",                   key: "nat-nebula-6k3p",     emoji: "🛰️",    accent: "#7cffb2", blurb: "Lives three timezones ahead of the rest of us." },
+  { id: "coral", name: "Coral",                 key: "coral-reef-1m9t",     emoji: "🚗",    accent: "#8ab4ff", blurb: "Will reschedule, but make it aesthetic." },
+];
+
+/* ---- date horizon: current month → 5 years out (rolling) ---- */
+const HORIZON_YEARS = 5;
+const MONTH_NAMES = ["JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"];
+function buildMonths() {
+  const list = []; const d0 = new Date();
+  for (let i = 0; i < HORIZON_YEARS * 12; i++) {
+    const dt = new Date(d0.getFullYear(), d0.getMonth() + i, 1);
+    list.push({ y: dt.getFullYear(), m: dt.getMonth(), label: MONTH_NAMES[dt.getMonth()] });
+  }
+  return list;
+}
+const MONTHS = buildMonths();
+
+const C = {
+  bg: "#070711", panel: "rgba(20,18,38,0.66)", panel2: "rgba(30,27,56,0.55)",
+  border: "rgba(140,130,255,0.16)", borderBright: "rgba(160,150,255,0.36)",
+  text: "#ece9ff", dim: "#9a96c4", faint: "#67638f",
+  free: "#56e39f", busy: "#ff5470", idk: "#ffc24d", cyan: "#34e8e0", magenta: "#ff3df0",
+};
+const STATUS = {
+  free: { key: "free", label: "FREE", sub: "let's gooo",        color: C.free, emoji: "🐱" },
+  busy: { key: "busy", label: "BUSY", sub: "do not perceive me", color: C.busy, emoji: "🙀" },
+  idk:  { key: "idk",  label: "IDK",  sub: "consult the cosmos", color: C.idk,  emoji: "🌀" },
+};
+const STATUS_CYCLE = ["free", "busy", "idk", null];
+
+const JOKES = [
+  "Schrödinger's calendar: simultaneously free and busy until observed.",
+  "I'd tell you a UDP joke but you might not get it.",
+  "Parallel parking is just collision detection IRL.",
+  "The cat said it'd RSVP right after a quick 14-hour nap.",
+  "We don't have plans, we have a distributed system with eventual consistency.",
+  "My car and I both refuse to start before coffee.",
+  "Friendship is the only protocol with zero packet loss.",
+  "Black holes invented 'do not perceive me' energy.",
+  "Ship your availability to prod — we'll roll back if it breaks.",
+  "404: free time not found. Try clearing your weekend cache.",
+  "Two cats walk into a garage. Now it's a startup.",
+  "The universe is expanding and so is my list of house projects.",
+];
+
+/* --------------------------- supabase layer --------------------------- */
+const DB = (() => {
+  try {
+    if (!SUPABASE_URL || SUPABASE_URL.indexOf("PASTE") === 0) return null;
+    if (!SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.indexOf("PASTE") === 0) return null;
+    return window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  } catch (e) { return null; }
+})();
+const DB_READY = !!DB;
+
+async function loadAllState() {
+  if (!DB) return {};
+  const { data, error } = await DB.from("nfp_state").select("*");
+  if (error || !data) return {};
+  const obj = {};
+  data.forEach((r) => { obj[r.uid] = { days: r.days || {}, vibe: r.vibe || "", updatedAt: Number(r.updated_at) || 0 }; });
+  return obj;
+}
+async function saveState(uid, days, vibe) {
+  if (!DB) return false;
+  const { error } = await DB.from("nfp_state").upsert({ uid, days, vibe, updated_at: Date.now() });
+  return !error;
+}
+async function loadMessages() {
+  if (!DB) return [];
+  const { data, error } = await DB.from("nfp_messages").select("*").order("ts", { ascending: true }).limit(300);
+  if (error || !data) return [];
+  return data.map((r) => ({ id: r.id, uid: r.uid, ts: Number(r.ts), text: r.body }));
+}
+async function sendMessage(msg) {
+  if (!DB) return false;
+  const { error } = await DB.from("nfp_messages").insert({ id: msg.id, uid: msg.uid, ts: msg.ts, body: msg.text });
+  return !error;
+}
+function loadMe() { try { return localStorage.getItem("nfp-me"); } catch (e) { return null; } }
+function saveMe(uid) { try { localStorage.setItem("nfp-me", uid); } catch (e) {} }
+function clearMe() { try { localStorage.removeItem("nfp-me"); } catch (e) {} }
+
+/* ------------------------------- helpers -------------------------------- */
+const pad = (n) => String(n).padStart(2, "0");
+const dstr = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
+const now0 = new Date();
+const TODAY = dstr(now0.getFullYear(), now0.getMonth(), now0.getDate());
+const WEEKDAYS = ["S", "M", "T", "W", "T", "F", "S"];
+const WD_LONG = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function allHorizonDays() {
+  const out = [];
+  for (const mo of MONTHS) {
+    const n = new Date(mo.y, mo.m + 1, 0).getDate();
+    for (let d = 1; d <= n; d++) out.push({ y: mo.y, m: mo.m, d, ds: dstr(mo.y, mo.m, d) });
+  }
+  return out;
+}
+const ALL_DAYS = allHorizonDays();
+const dayDiff = (ds) => Math.round((new Date(ds + "T00:00:00") - new Date(TODAY + "T00:00:00")) / 86400000);
+function relTime(ms) {
+  if (!ms) return "never";
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+const hexA = (hex, a) => {
+  const h = hex.replace("#", "");
+  return `rgba(${parseInt(h.slice(0,2),16)},${parseInt(h.slice(2,4),16)},${parseInt(h.slice(4,6),16)},${a})`;
+};
+function unionById(a, b) {
+  const seen = new Map();
+  for (const m of a) if (m && m.id) seen.set(m.id, m);
+  for (const m of b) if (m && m.id) seen.set(m.id, m);
+  return Array.from(seen.values()).sort((x, y) => x.ts - y.ts);
+}
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Mono:wght@400;700&display=swap');
+@keyframes nfpFadeUp { from { opacity:0; transform: translateY(10px);} to { opacity:1; transform:none;} }
+@keyframes nfpPulse { 0%,100% { opacity:.35; transform:scale(1);} 50% { opacity:.6; transform:scale(1.08);} }
+@keyframes nfpDrift { from { background-position: 0 0, 0 0, 0 0;} to { background-position: 600px 900px, -500px 400px, 300px -700px;} }
+@keyframes nfpBlink { 0%,100% { opacity:1;} 50% { opacity:.15;} }
+@keyframes nfpMarquee { from { transform: translateX(0);} to { transform: translateX(-50%);} }
+@keyframes nfpSpin { to { transform: rotate(360deg);} }
+@keyframes nfpPop { 0% { transform:scale(.7); opacity:0;} 60% { transform:scale(1.12);} 100% { transform:scale(1); opacity:1;} }
+* { box-sizing: border-box; }
+body { margin:0; }
+.nfp-cell { transition: transform .12s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease; }
+.nfp-cell:not(:disabled):hover { transform: translateY(-2px) scale(1.03); }
+.nfp-btn { transition: transform .1s ease, box-shadow .15s ease, background .15s ease, color .15s ease, border-color .15s ease; }
+.nfp-btn:hover { transform: translateY(-1px); }
+.nfp-btn:active { transform: translateY(0) scale(.98); }
+.nfp-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.nfp-scroll::-webkit-scrollbar-thumb { background: ${hexA(C.cyan, 0.25)}; border-radius: 99px; }
+.nfp-scroll::-webkit-scrollbar-track { background: transparent; }
+.nfp-blink { animation: nfpBlink 1.1s steps(1) infinite; }
+input::placeholder { color: ${C.faint}; }
+input, button { font-family: inherit; }
+`;
+
+/* ------------------------------- icons --------------------------------- */
+function Icon({ name, size = 16, color = "currentColor", style }) {
+  const s = { width: size, height: size, display: "block", ...style };
+  const stroke = { fill: "none", stroke: color, strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" };
+  const V = (children, extra) => <svg viewBox="0 0 24 24" style={s} {...extra}>{children}</svg>;
+  switch (name) {
+    case "chevron-left": return V(<path d="m15 18-6-6 6-6" {...stroke} />);
+    case "chevron-right": return V(<path d="m9 18 6-6-6-6" {...stroke} />);
+    case "refresh": return V(<g {...stroke}><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v5h-5" /></g>);
+    case "logout": return V(<g {...stroke}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="m16 17 5-5-5-5" /><path d="M21 12H9" /></g>);
+    case "sparkles": return V(<g><path fill={color} d="M12 2l1.8 5.6L19.5 9.4l-5.7 1.8L12 17l-1.8-5.8L4.5 9.4l5.7-1.8z" /><path fill={color} d="M19 14l.6 1.9 1.9.6-1.9.6L19 19l-.6-1.9-1.9-.6 1.9-.6z" /></g>);
+    case "calendar": return V(<g {...stroke}><rect x="3" y="4" width="18" height="17" rx="2" /><path d="M3 9h18M8 3v4M16 3v4" /></g>);
+    case "users": return V(<g {...stroke}><circle cx="9" cy="8" r="3.5" /><path d="M3.5 20v-1a5.5 5.5 0 0 1 11 0v1" /><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8" /><path d="M20.5 20v-1a5.5 5.5 0 0 0-3-4.9" /></g>);
+    case "message": return V(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" {...stroke} />);
+    case "send": return V(<g {...stroke}><path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4z" /></g>);
+    case "radio": return V(<g {...stroke}><circle cx="12" cy="12" r="2" fill={color} stroke="none" /><path d="M16.24 7.76a6 6 0 0 1 0 8.49" /><path d="M7.76 16.24a6 6 0 0 1 0-8.49" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14" /><path d="M4.93 19.07a10 10 0 0 1 0-14.14" /></g>);
+    case "key": return V(<g {...stroke}><circle cx="7.5" cy="15.5" r="4.3" /><path d="M10.6 12.4 20 3" /><path d="M16 7l3 3" /><path d="M18.5 4.5l2 2" /></g>);
+    case "paw": return V(<g fill={color}><ellipse cx="6" cy="10" rx="1.7" ry="2.3" /><ellipse cx="10" cy="6.6" rx="1.8" ry="2.4" /><ellipse cx="14" cy="6.6" rx="1.8" ry="2.4" /><ellipse cx="18" cy="10" rx="1.7" ry="2.3" /><path d="M12 11.5c3 0 5.5 2.6 5.5 5.3 0 2-1.6 3.2-3.4 3.2-1 0-1.1.5-2.1.5s-1.1-.5-2.1-.5C8.1 20 6.5 18.8 6.5 16.8c0-2.7 2.5-5.3 5.5-5.3z" /></g>);
+    case "star": return V(<path fill={color} d="M12 2.5l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 18l-5.8 3 1.1-6.5L2.6 9.3l6.5-.9z" />);
+    case "moon": return V(<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" {...stroke} />);
+    case "gauge": return V(<g {...stroke}><path d="M4 16a8 8 0 1 1 16 0" /><path d="M12 14.5 15.5 11" /></g>);
+    case "orbit": return V(<g><circle cx="12" cy="12" r="3" fill={color} /><ellipse cx="12" cy="12" rx="10" ry="4.4" fill="none" stroke={color} strokeWidth="1.6" transform="rotate(-28 12 12)" /><circle cx="20.2" cy="8.4" r="1.6" fill={color} /></g>);
+    case "zap": return V(<path fill={color} d="M13 2 4 14h6l-1 8 9-12h-6z" />);
+    default: return null;
+  }
+}
+
+/* ================================ APP ================================== */
+function NFP() {
+  const [me, setMe] = useState(null);
+  const [allData, setAllData] = useState({});
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [saveStateV, setSaveStateV] = useState("idle");
+  const [tab, setTab] = useState("days");
+  const [monthIdx, setMonthIdx] = useState(0);
+  const [convRange, setConvRange] = useState("14");
+  const [keyInput, setKeyInput] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [vibeInput, setVibeInput] = useState("");
+  const [toast, setToast] = useState("");
+  const [chatInput, setChatInput] = useState("");
+
+  const saveTimer = useRef(null);
+  const toastTimer = useRef(null);
+  const chatScroll = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      if (!DB_READY) { setLoading(false); return; }
+      const m = loadMe();
+      const [state, msgs] = await Promise.all([loadAllState(), loadMessages()]);
+      setAllData(state); setMessages(msgs);
+      if (m && USERS.some((u) => u.id === m)) { setMe(m); setVibeInput(state[m]?.vibe || ""); }
+      setLoading(false);
+    })();
+  }, []);
+
+  const refreshAll = useCallback(async (silent = false) => {
+    if (!DB_READY) return;
+    if (!silent) setSyncing(true);
+    const [state, msgs] = await Promise.all([loadAllState(), loadMessages()]);
+    setAllData((prev) => {
+      const next = { ...prev };
+      for (const uid of Object.keys(state)) {
+        if (uid === me) { const local = prev[me]; if (local && local.updatedAt >= state[uid].updatedAt) continue; }
+        next[uid] = state[uid];
+      }
+      return next;
+    });
+    setMessages((prev) => unionById(prev, msgs));
+    if (!silent) { setSyncing(false); flashToast("🛰️ re-synced with the mothership"); }
+  }, [me]);
+
+  useEffect(() => {
+    if (!me) return;
+    const ms = tab === "chat" ? 6000 : 20000;
+    const id = setInterval(() => refreshAll(true), ms);
+    return () => clearInterval(id);
+  }, [me, tab, refreshAll]);
+
+  function flashToast(msg) {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(""), 2600);
+  }
+
+  const queueSave = useCallback((uid, days, vibe) => {
+    setSaveStateV("saving");
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      const ok = await saveState(uid, days, vibe);
+      setSaveStateV(ok ? "saved" : "error");
+      if (ok) setTimeout(() => setSaveStateV("idle"), 1400);
+    }, 550);
+  }, []);
+
+  const submitKey = () => {
+    const k = keyInput.trim().toLowerCase();
+    if (!k) return;
+    const found = USERS.find((u) => { const uk = u.key.toLowerCase(); return k === uk || k.endsWith(uk) || k.endsWith("key=" + uk); });
+    if (!found) { setAuthError("ACCESS DENIED — that key smells faintly of dog 🐶"); return; }
+    setMe(found.id); setVibeInput(allData[found.id]?.vibe || ""); saveMe(found.id);
+    setAuthError(""); setKeyInput(""); flashToast(`${found.emoji} welcome back, ${found.name}`);
+  };
+  const logout = () => { clearMe(); setMe(null); setTab("days"); setKeyInput(""); setAuthError(""); };
+
+  const cycleDay = (ds) => {
+    if (!me || ds < TODAY) return;
+    setAllData((prev) => {
+      const mine = prev[me] || { days: {}, vibe: "", updatedAt: 0 };
+      const cur = mine.days[ds] || null;
+      const next = STATUS_CYCLE[(STATUS_CYCLE.indexOf(cur) + 1) % STATUS_CYCLE.length];
+      const days = { ...mine.days };
+      if (next === null) delete days[ds]; else days[ds] = next;
+      const updated = { ...mine, days, updatedAt: Date.now() };
+      queueSave(me, days, updated.vibe);
+      return { ...prev, [me]: updated };
+    });
+  };
+  const onVibe = (val) => {
+    setVibeInput(val);
+    if (!me) return;
+    setAllData((prev) => {
+      const mine = prev[me] || { days: {}, vibe: "", updatedAt: 0 };
+      queueSave(me, mine.days, val);
+      return { ...prev, [me]: { ...mine, vibe: val, updatedAt: Date.now() } };
+    });
+  };
+
+  const sendChat = async () => {
+    const text = chatInput.trim();
+    if (!text || !me) return;
+    const msg = { id: `${me}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, uid: me, ts: Date.now(), text: text.slice(0, 280) };
+    setChatInput("");
+    setMessages((prev) => unionById(prev, [msg]));
+    const ok = await sendMessage(msg);
+    if (!ok) flashToast("📡 message lost in a wormhole — try again");
+    else setTimeout(() => refreshAll(true), 1000);
+  };
+  const feed = useMemo(() => [...messages].sort((a, b) => a.ts - b.ts).slice(-200), [messages]);
+  useEffect(() => { if (tab === "chat" && chatScroll.current) chatScroll.current.scrollTop = chatScroll.current.scrollHeight; }, [feed.length, tab]);
+
+  const convDays = useMemo(() => {
+    let days = ALL_DAYS.filter((x) => x.ds >= TODAY);
+    if (convRange === "14") days = days.slice(0, 14);
+    else if (convRange === "month") days = days.filter((x) => x.m === now0.getMonth() && x.y === now0.getFullYear());
+    else if (convRange === "90") days = days.slice(0, 90);
+    return days.map((x) => {
+      const dt = new Date(x.y, x.m, x.d);
+      let free = 0, busy = 0, idk = 0; const freeUsers = []; const statuses = {};
+      for (const u of USERS) {
+        const sx = allData[u.id]?.days?.[x.ds] || null; statuses[u.id] = sx;
+        if (sx === "free") { free++; freeUsers.push(u); } else if (sx === "busy") busy++; else if (sx === "idk") idk++;
+      }
+      return { ...x, wd: dt.getDay(), free, busy, idk, freeUsers, statuses };
+    });
+  }, [allData, convRange]);
+
+  const bestDays = useMemo(() => {
+    return ALL_DAYS.filter((x) => x.ds >= TODAY && dayDiff(x.ds) <= 120)
+      .map((x) => {
+        const dt = new Date(x.y, x.m, x.d);
+        let free = 0; const freeUsers = [];
+        for (const u of USERS) if (allData[u.id]?.days?.[x.ds] === "free") { free++; freeUsers.push(u); }
+        return { ...x, wd: dt.getDay(), free, freeUsers };
+      })
+      .filter((x) => x.free >= 2)
+      .sort((a, b) => b.free - a.free || a.ds.localeCompare(b.ds))
+      .slice(0, 6);
+  }, [allData]);
+
+  const allFreeDays = useMemo(() => {
+    return ALL_DAYS.filter((x) => x.ds >= TODAY && dayDiff(x.ds) <= 365)
+      .filter((x) => USERS.every((u) => allData[u.id]?.days?.[x.ds] === "free"))
+      .map((x) => ({ ...x, wd: new Date(x.y, x.m, x.d).getDay() }))
+      .sort((a, b) => a.ds.localeCompare(b.ds));
+  }, [allData]);
+
+  const checkedIn = USERS.filter((u) => { const d = allData[u.id]; return d && (Object.keys(d.days || {}).length > 0 || (d.vibe || "").trim()); }).length;
+
+  return (
+    <div className="nfp-scroll" style={{ minHeight: "100vh", width: "100%", position: "relative", background: C.bg, color: C.text, fontFamily: "'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace", overflowX: "hidden" }}>
+      <style>{CSS}</style>
+      <Cosmos />
+      <div style={{ position: "relative", zIndex: 2, maxWidth: 960, margin: "0 auto", padding: "0 16px 90px" }}>
+        {!DB_READY ? (
+          <Setup />
+        ) : loading ? (
+          <Booting />
+        ) : !me ? (
+          <Login keyInput={keyInput} setKeyInput={setKeyInput} authError={authError} submitKey={submitKey} />
+        ) : (
+          <>
+            <Header me={me} syncing={syncing} saveStateV={saveStateV} onRefresh={() => refreshAll(false)} onLogout={logout} />
+            <Tabs tab={tab} setTab={setTab} convBadge={allFreeDays.length} />
+            {tab === "days" && <MyDays me={me} allData={allData} monthIdx={monthIdx} setMonthIdx={setMonthIdx} cycleDay={cycleDay} vibeInput={vibeInput} onVibe={onVibe} />}
+            {tab === "conv" && <Convergence convDays={convDays} bestDays={bestDays} convRange={convRange} setConvRange={setConvRange} checkedIn={checkedIn} allFreeDays={allFreeDays} goChat={() => setTab("chat")} />}
+            {tab === "chat" && <Chat me={me} feed={feed} chatInput={chatInput} setChatInput={setChatInput} sendChat={sendChat} scrollRef={chatScroll} />}
+            {tab === "crew" && <Crew me={me} allData={allData} />}
+          </>
+        )}
+      </div>
+      {toast && (
+        <div style={{ position: "fixed", bottom: 70, left: "50%", transform: "translateX(-50%)", zIndex: 30, background: "rgba(10,9,22,0.92)", border: `1px solid ${C.borderBright}`, color: C.text, padding: "10px 18px", borderRadius: 12, fontSize: 13, boxShadow: `0 0 30px ${hexA(C.cyan, 0.25)}`, animation: "nfpPop .25s ease" }}>{toast}</div>
+      )}
+      <Ticker />
+    </div>
+  );
+}
+
+function Cosmos() {
+  return (
+    <div aria-hidden style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", backgroundColor: C.bg,
+      backgroundImage: "radial-gradient(2px 2px at 20% 30%, rgba(255,255,255,.9), transparent), radial-gradient(1.5px 1.5px at 70% 60%, rgba(180,210,255,.8), transparent), radial-gradient(1px 1px at 40% 80%, rgba(255,255,255,.7), transparent), radial-gradient(1px 1px at 85% 25%, rgba(255,220,255,.7), transparent), radial-gradient(1.5px 1.5px at 15% 70%, rgba(200,255,240,.7), transparent)",
+      backgroundSize: "700px 700px, 600px 600px, 500px 500px", animation: "nfpDrift 90s linear infinite" }}>
+      <div style={{ position: "absolute", top: "-12%", left: "-8%", width: 520, height: 520, borderRadius: "50%", background: `radial-gradient(circle, ${hexA(C.magenta, 0.22)}, transparent 65%)`, filter: "blur(30px)", animation: "nfpPulse 11s ease-in-out infinite" }} />
+      <div style={{ position: "absolute", bottom: "-15%", right: "-10%", width: 600, height: 600, borderRadius: "50%", background: `radial-gradient(circle, ${hexA(C.cyan, 0.18)}, transparent 65%)`, filter: "blur(34px)", animation: "nfpPulse 14s ease-in-out infinite" }} />
+      <div style={{ position: "absolute", inset: 0, opacity: 0.5, backgroundImage: "repeating-linear-gradient(0deg, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px)" }} />
+    </div>
+  );
+}
+
+function Booting() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "70vh", gap: 18 }}>
+      <Icon name="orbit" size={44} color={C.cyan} style={{ animation: "nfpSpin 3s linear infinite" }} />
+      <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 30, letterSpacing: 3 }}>WAKING THE CATS</div>
+      <div style={{ color: C.dim, fontSize: 13 }}>negotiating with spacetime<span className="nfp-blink">_</span></div>
+    </div>
+  );
+}
+
+function Setup() {
+  const sql = `create table if not exists nfp_state (
+  uid text primary key,
+  days jsonb default '{}'::jsonb,
+  vibe text default '',
+  updated_at bigint default 0
+);
+create table if not exists nfp_messages (
+  id text primary key,
+  uid text not null,
+  ts bigint not null,
+  body text not null
+);
+create index if not exists nfp_messages_ts on nfp_messages (ts);
+
+alter table nfp_state enable row level security;
+alter table nfp_messages enable row level security;
+create policy "nfp_state anon all" on nfp_state
+  for all to anon using (true) with check (true);
+create policy "nfp_messages anon all" on nfp_messages
+  for all to anon using (true) with check (true);`;
+  const step = { display: "flex", gap: 10, marginBottom: 12, alignItems: "flex-start" };
+  const num = (n) => (<span style={{ flexShrink: 0, width: 24, height: 24, borderRadius: 8, background: hexA(C.cyan, 0.15), border: `1px solid ${hexA(C.cyan, 0.5)}`, color: C.cyan, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700 }}>{n}</span>);
+  return (
+    <div style={{ paddingTop: 60, maxWidth: 620, margin: "0 auto" }}>
+      <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 60, letterSpacing: 2, lineHeight: 0.9 }}>NFP</div>
+      <div style={{ fontSize: 12, letterSpacing: 2.5, color: C.cyan }}>NATURAL · FELINE · PLANNING</div>
+      <div style={{ marginTop: 18, background: C.panel, border: `1px solid ${hexA(C.idk, 0.4)}`, borderRadius: 16, padding: 20 }}>
+        <div style={{ color: C.idk, fontWeight: 700, marginBottom: 14, letterSpacing: 0.5 }}>⚙️ Backend not connected yet — quick one-time setup:</div>
+        <div style={step}>{num(1)}<div style={{ fontSize: 13, color: C.text, lineHeight: 1.5 }}>Make a free project at <b>supabase.com</b>.</div></div>
+        <div style={step}>{num(2)}<div style={{ fontSize: 13, color: C.text, lineHeight: 1.5 }}>In the project's <b>SQL Editor</b>, paste &amp; run this once:
+          <pre className="nfp-scroll" style={{ marginTop: 8, marginBottom: 0, overflowX: "auto", background: "rgba(0,0,0,0.4)", border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, fontSize: 11.5, color: C.dim, lineHeight: 1.5 }}>{sql}</pre>
+        </div></div>
+        <div style={step}>{num(3)}<div style={{ fontSize: 13, color: C.text, lineHeight: 1.5 }}>Open <b>Project Settings → API</b>, copy your <b>Project URL</b> and <b>anon public key</b>.</div></div>
+        <div style={step}>{num(4)}<div style={{ fontSize: 13, color: C.text, lineHeight: 1.5 }}>Paste both into the <b>CONFIG</b> block near the top of this HTML file (<span style={{ color: C.cyan }}>SUPABASE_URL</span> / <span style={{ color: C.cyan }}>SUPABASE_ANON_KEY</span>), save, and reload.</div></div>
+        <div style={{ fontSize: 11, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>That's it. Then host this file anywhere (or open it directly) and share the link — no Claude accounts needed.</div>
+      </div>
+    </div>
+  );
+}
+
+function Login({ keyInput, setKeyInput, authError, submitKey }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "center", alignItems: "center", minHeight: "100vh", padding: "40px 0" }}>
+      <div style={{ width: "100%", maxWidth: 440, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 20, padding: "34px 28px 28px", backdropFilter: "blur(10px)", boxShadow: `0 0 60px ${hexA(C.magenta, 0.12)}, inset 0 1px 0 rgba(255,255,255,0.04)`, animation: "nfpFadeUp .5s ease both" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, color: C.faint, fontSize: 11, letterSpacing: 1.5 }}><Icon name="radio" size={13} /> <span>AUTHORIZED FELINES ONLY</span></div>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 10, marginTop: 6 }}>
+          <span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 76, lineHeight: 0.82, letterSpacing: 2 }}>NFP</span>
+          <Icon name="paw" size={26} color={C.cyan} style={{ marginBottom: 12 }} />
+        </div>
+        <div style={{ fontSize: 12, letterSpacing: 2.5, color: C.cyan, marginTop: 2 }}>NATURAL · FELINE · PLANNING</div>
+        <p style={{ color: C.dim, fontSize: 13, lineHeight: 1.55, margin: "16px 0 20px" }}>Five busy cats. Infinite house projects. One summer. Paste your magic key, you beautiful disaster, and let's find the days the stars align. 🪐</p>
+        <label style={{ fontSize: 11, color: C.faint, letterSpacing: 1, display: "flex", alignItems: "center", gap: 6 }}><Icon name="key" size={13} /> MAGIC KEY</label>
+        <input value={keyInput} onChange={(e) => setKeyInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitKey()} placeholder="paste-your-key-here" autoFocus spellCheck={false}
+          style={{ width: "100%", marginTop: 7, padding: "12px 14px", borderRadius: 11, background: "rgba(0,0,0,0.32)", border: `1px solid ${authError ? hexA(C.busy, 0.6) : C.border}`, color: C.text, fontSize: 14, outline: "none" }} />
+        {authError && <div style={{ color: C.busy, fontSize: 12, marginTop: 8, animation: "nfpFadeUp .2s ease" }}>{authError}</div>}
+        <button className="nfp-btn" onClick={submitKey} style={{ width: "100%", marginTop: 16, padding: "13px", borderRadius: 11, border: "none", cursor: "pointer", fontFamily: "'Bebas Neue', sans-serif", fontSize: 21, letterSpacing: 2, color: "#070711", background: `linear-gradient(95deg, ${C.cyan}, ${C.free})`, boxShadow: `0 6px 26px ${hexA(C.cyan, 0.4)}` }}>INJECT KEY → MAINFRAME</button>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 18, color: C.faint, fontSize: 18 }}>{USERS.map((u) => <span key={u.id} title={u.name}>{u.emoji}</span>)}</div>
+        <div style={{ textAlign: "center", color: C.faint, fontSize: 11, marginTop: 6, letterSpacing: 0.5 }}>5 felines registered · 0 dogs allowed</div>
+      </div>
+    </div>
+  );
+}
+
+function Header({ me, syncing, saveStateV, onRefresh, onLogout }) {
+  const u = USERS.find((x) => x.id === me);
+  const saveLabel = { saving: "saving…", saved: "✓ saved", error: "⚠ retry", idle: "" }[saveStateV];
+  return (
+    <div style={{ paddingTop: 22, animation: "nfpFadeUp .4s ease both" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+          <span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 40, letterSpacing: 2, lineHeight: 1 }}>NFP</span>
+          <span style={{ fontSize: 11, letterSpacing: 1.5, color: C.faint }}>MISSION CONTROL</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 12, color: C.dim, minWidth: 56, textAlign: "right" }}>{saveLabel}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", borderRadius: 99, background: hexA(u.accent, 0.12), border: `1px solid ${hexA(u.accent, 0.4)}` }}>
+            <span style={{ fontSize: 16 }}>{u.emoji}</span>
+            <span style={{ fontSize: 13, color: u.accent, fontWeight: 700 }}>{u.name}</span>
+          </div>
+          <IconBtn onClick={onRefresh} title="re-sync with the squad"><Icon name="refresh" size={16} style={syncing ? { animation: "nfpSpin .8s linear infinite" } : undefined} /></IconBtn>
+          <IconBtn onClick={onLogout} title="switch feline"><Icon name="logout" size={16} /></IconBtn>
+        </div>
+      </div>
+    </div>
+  );
+}
+function IconBtn({ children, onClick, title }) {
+  return <button className="nfp-btn" onClick={onClick} title={title} style={{ width: 38, height: 38, borderRadius: 11, cursor: "pointer", color: C.dim, background: C.panel2, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "center" }}>{children}</button>;
+}
+
+function Tabs({ tab, setTab, convBadge = 0 }) {
+  const items = [
+    { id: "days", label: "MY DAYS", icon: "calendar" },
+    { id: "conv", label: "CONVERGENCE", icon: "sparkles", badge: convBadge },
+    { id: "chat", label: "CHAT", icon: "message" },
+    { id: "crew", label: "THE SQUAD", icon: "users" },
+  ];
+  return (
+    <div style={{ display: "flex", gap: 8, margin: "20px 0 18px", flexWrap: "wrap" }}>
+      {items.map((it) => {
+        const on = tab === it.id;
+        return (
+          <button key={it.id} className="nfp-btn" onClick={() => setTab(it.id)} style={{ position: "relative", display: "flex", alignItems: "center", gap: 8, padding: "9px 16px", borderRadius: 11, cursor: "pointer", fontFamily: "'Bebas Neue', sans-serif", fontSize: 17, letterSpacing: 1.5, color: on ? "#070711" : C.dim, background: on ? `linear-gradient(95deg, ${C.cyan}, ${C.free})` : C.panel2, border: `1px solid ${on ? "transparent" : C.border}`, boxShadow: on ? `0 4px 18px ${hexA(C.cyan, 0.3)}` : "none" }}>
+            <Icon name={it.icon} size={15} /> {it.label}
+            {it.badge > 0 && <span style={{ minWidth: 18, height: 18, padding: "0 5px", borderRadius: 99, background: C.free, color: "#04130b", fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: `0 0 10px ${hexA(C.free, 0.7)}`, animation: "nfpPulse 1.6s ease-in-out infinite" }}>{it.badge}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function Panel({ children, style }) {
+  return <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16, padding: 18, backdropFilter: "blur(8px)", animation: "nfpFadeUp .45s ease both", ...style }}>{children}</div>;
+}
+
+function Legend() {
+  return (
+    <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+      {Object.values(STATUS).map((s) => (
+        <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 7 }}>
+          <span style={{ width: 14, height: 14, borderRadius: 4, background: hexA(s.color, 0.25), border: `1px solid ${s.color}`, display: "inline-block" }} />
+          <span style={{ fontSize: 12, color: C.text, fontWeight: 700 }}>{s.label}</span>
+          <span style={{ fontSize: 11, color: C.faint }}>· {s.sub}</span>
+        </div>
+      ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+        <span style={{ width: 14, height: 14, borderRadius: 4, border: `1px dashed ${C.faint}`, display: "inline-block" }} />
+        <span style={{ fontSize: 11, color: C.faint }}>untracked · the void</span>
+      </div>
+    </div>
+  );
+}
+
+function MyDays({ me, allData, monthIdx, setMonthIdx, cycleDay, vibeInput, onVibe }) {
+  const mo = MONTHS[monthIdx];
+  const mine = allData[me]?.days || {};
+  const startDow = new Date(mo.y, mo.m, 1).getDay();
+  const numDays = new Date(mo.y, mo.m + 1, 0).getDate();
+  const cells = [];
+  for (let i = 0; i < startDow; i++) cells.push(null);
+  for (let d = 1; d <= numDays; d++) cells.push(d);
+  let free = 0, busy = 0, idk = 0;
+  for (let d = 1; d <= numDays; d++) { const sx = mine[dstr(mo.y, mo.m, d)]; if (sx === "free") free++; else if (sx === "busy") busy++; else if (sx === "idk") idk++; }
+  return (
+    <>
+      <Panel style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <button className="nfp-btn" onClick={() => setMonthIdx(Math.max(0, monthIdx - 1))} disabled={monthIdx === 0} style={navBtn(monthIdx === 0)}><Icon name="chevron-left" size={18} /></button>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 34, letterSpacing: 3, lineHeight: 1 }}>{mo.label} {mo.y}</div>
+            {monthIdx === 0 ? (
+              <div style={{ fontSize: 11, color: C.faint, letterSpacing: 2 }}>tap a day to cycle · this month</div>
+            ) : (
+              <button onClick={() => setMonthIdx(0)} className="nfp-btn" style={{ fontSize: 11, color: C.cyan, letterSpacing: 1, background: "none", border: "none", cursor: "pointer", marginTop: 2 }}>↺ back to this month (+{monthIdx} mo out)</button>
+            )}
+          </div>
+          <button className="nfp-btn" onClick={() => setMonthIdx(Math.min(MONTHS.length - 1, monthIdx + 1))} disabled={monthIdx === MONTHS.length - 1} style={navBtn(monthIdx === MONTHS.length - 1)}><Icon name="chevron-right" size={18} /></button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+          {WEEKDAYS.map((w, i) => <div key={i} style={{ textAlign: "center", fontSize: 11, color: C.faint, paddingBottom: 2, letterSpacing: 1 }}>{w}</div>)}
+          {cells.map((d, i) => {
+            if (d === null) return <div key={"b" + i} />;
+            const ds = dstr(mo.y, mo.m, d);
+            const sx = mine[ds]; const meta = sx ? STATUS[sx] : null;
+            const past = ds < TODAY; const isToday = ds === TODAY;
+            return (
+              <button key={ds} className="nfp-cell" onClick={() => cycleDay(ds)} disabled={past} title={past ? "the past is immutable, like prod on a Friday" : meta ? meta.label : "tap to set"}
+                style={{ aspectRatio: "1 / 1", borderRadius: 11, cursor: past ? "default" : "pointer", position: "relative", padding: 0, color: C.text,
+                  background: meta ? hexA(meta.color, 0.16) : "rgba(255,255,255,0.02)", border: meta ? `1px solid ${hexA(meta.color, 0.7)}` : `1px dashed ${hexA(C.faint, 0.5)}`,
+                  opacity: past ? 0.22 : 1, boxShadow: isToday ? `0 0 0 2px ${C.cyan}, 0 0 16px ${hexA(C.cyan, 0.45)}` : meta ? `0 0 12px ${hexA(meta.color, 0.2)}` : "none",
+                  display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 }}>
+                <span style={{ position: "absolute", top: 5, left: 7, fontSize: 11, color: meta ? meta.color : C.faint, fontWeight: 700 }}>{d}</span>
+                {meta && <span style={{ fontSize: 20, lineHeight: 1, marginTop: 6 }}>{meta.emoji}</span>}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ marginTop: 16, paddingTop: 14, borderTop: `1px solid ${C.border}` }}><Legend /></div>
+      </Panel>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 14 }}>
+        <Stat n={free} label="FREE this month" color={C.free} />
+        <Stat n={busy} label="BUSY this month" color={C.busy} />
+        <Stat n={idk} label="cosmic maybes" color={C.idk} />
+      </div>
+      <Panel>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: C.faint, letterSpacing: 1.5, marginBottom: 8 }}><Icon name="zap" size={13} color={C.magenta} /> YOUR CURRENT VIBE (broadcast to the squad)</div>
+        <input value={vibeInput} onChange={(e) => onVibe(e.target.value)} maxLength={90} placeholder="e.g. lock me in for July, deep in a garage project all June"
+          style={{ width: "100%", padding: "11px 14px", borderRadius: 11, background: "rgba(0,0,0,0.3)", border: `1px solid ${C.border}`, color: C.text, fontSize: 13, outline: "none" }} />
+      </Panel>
+    </>
+  );
+}
+function Stat({ n, label, color }) {
+  return <div style={{ background: C.panel2, border: `1px solid ${hexA(color, 0.3)}`, borderRadius: 13, padding: "12px 16px" }}><div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 38, lineHeight: 1, color }}>{n}</div><div style={{ fontSize: 11, color: C.dim, letterSpacing: 0.5 }}>{label}</div></div>;
+}
+
+function Convergence({ convDays, bestDays, convRange, setConvRange, checkedIn, allFreeDays = [], goChat }) {
+  const ranges = [{ id: "14", label: "NEXT 14" }, { id: "month", label: "THIS MONTH" }, { id: "90", label: "NEXT 90" }];
+  return (
+    <>
+      {allFreeDays.length > 0 && <FullHouseBanner days={allFreeDays} goChat={goChat} />}
+      <Panel style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}><Icon name="sparkles" size={16} color={C.magenta} /><span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 26, letterSpacing: 2 }}>WHEN THE STARS ALIGN</span></div>
+        <div style={{ fontSize: 12, color: C.faint, marginBottom: 14 }}>{checkedIn}/5 felines have phoned home · best overlaps in the next ~4 months</div>
+        {bestDays.length === 0 ? (
+          <Empty icon={<Icon name="moon" size={30} color={C.faint} />} title="no strong signals yet" sub="nobody's marked enough free days. poke the squad — the void is listening." />
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 10 }}>
+            {bestDays.map((b, i) => {
+              const full = b.free === 5; const dt = new Date(b.y, b.m, b.d);
+              const tier = full ? "FULL HOUSE 🎉" : b.free === 4 ? "near-total alignment" : b.free === 3 ? "quorum achieved" : "signal detected";
+              return (
+                <div key={b.ds} style={{ background: full ? hexA(C.free, 0.12) : C.panel2, border: `1px solid ${full ? C.free : hexA(C.cyan, 0.3)}`, borderRadius: 13, padding: "13px 15px", position: "relative", boxShadow: full ? `0 0 24px ${hexA(C.free, 0.3)}` : "none", animation: "nfpFadeUp .4s ease both", animationDelay: `${i * 50}ms` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                    <span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 30, letterSpacing: 1, lineHeight: 1 }}>{WD_LONG[b.wd].toUpperCase()}</span>
+                    <span style={{ fontSize: 13, color: C.dim }}>{dt.toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>
+                  </div>
+                  <div style={{ fontSize: 11, letterSpacing: 1, color: full ? C.free : C.cyan, marginTop: 2, fontWeight: 700 }}>{b.free}/5 FREE · {tier}</div>
+                  <div style={{ display: "flex", gap: 5, marginTop: 9, flexWrap: "wrap" }}>
+                    {b.freeUsers.map((u) => <span key={u.id} title={u.name} style={{ fontSize: 15, width: 26, height: 26, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", background: hexA(u.accent, 0.15), border: `1px solid ${hexA(u.accent, 0.5)}` }}>{u.emoji}</span>)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Panel>
+      <Panel>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Icon name="gauge" size={16} color={C.cyan} /><span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 24, letterSpacing: 2 }}>THE OVERLAP MATRIX</span></div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {ranges.map((r) => { const on = convRange === r.id; return <button key={r.id} className="nfp-btn" onClick={() => setConvRange(r.id)} style={{ padding: "6px 12px", borderRadius: 9, cursor: "pointer", fontSize: 11, letterSpacing: 1, fontWeight: 700, color: on ? "#070711" : C.dim, background: on ? C.cyan : C.panel2, border: `1px solid ${on ? "transparent" : C.border}` }}>{r.label}</button>; })}
+          </div>
+        </div>
+        {convDays.length === 0 ? (
+          <Empty icon={<Icon name="star" size={28} color={C.faint} />} title="nothing in this window" sub="try a wider range." />
+        ) : (
+          <div className="nfp-scroll" style={{ overflowX: "auto" }}>
+            <div style={{ minWidth: 460 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "92px repeat(5, 1fr) 64px", gap: 5, marginBottom: 6, padding: "0 6px", alignItems: "center" }}>
+                <div style={{ fontSize: 10, color: C.faint, letterSpacing: 1 }}>DATE</div>
+                {USERS.map((u) => <div key={u.id} title={u.name} style={{ textAlign: "center", fontSize: 16 }}>{u.emoji}</div>)}
+                <div style={{ fontSize: 10, color: C.faint, textAlign: "center", letterSpacing: 1 }}>FREE</div>
+              </div>
+              {convDays.map((row) => {
+                const dt = new Date(row.y, row.m, row.d);
+                const weekend = row.wd === 0 || row.wd === 6; const full = row.free === 5;
+                return (
+                  <div key={row.ds} style={{ display: "grid", gridTemplateColumns: "92px repeat(5, 1fr) 64px", gap: 5, alignItems: "center", padding: "4px 6px", borderTop: `1px solid ${hexA(C.border, 0.6)}`, background: full ? hexA(C.free, 0.1) : "transparent", borderLeft: full ? `2px solid ${C.free}` : "2px solid transparent", borderRadius: full ? 6 : 0 }}>
+                    <div style={{ fontSize: 12, color: full ? C.free : weekend ? C.cyan : C.dim }}>
+                      <span style={{ fontWeight: 700 }}>{WD_LONG[row.wd]}</span>{" "}
+                      <span style={{ color: full ? hexA(C.free, 0.8) : C.faint }}>{dt.getMonth() + 1}/{row.d}</span>
+                    </div>
+                    {USERS.map((u) => {
+                      const sx = row.statuses[u.id]; const meta = sx ? STATUS[sx] : null;
+                      return (
+                        <div key={u.id} style={{ display: "flex", justifyContent: "center" }}>
+                          <span title={`${u.name}: ${meta ? meta.label : "untracked"}`} style={{ width: 24, height: 24, borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, background: meta ? hexA(meta.color, 0.2) : "transparent", border: meta ? `1px solid ${hexA(meta.color, 0.65)}` : `1px dashed ${hexA(C.faint, 0.45)}`, color: meta ? meta.color : C.faint }}>
+                            {meta ? (sx === "free" ? "✓" : sx === "busy" ? "✕" : "?") : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    <div style={{ display: "flex", alignItems: "center", gap: 5, justifyContent: "center" }}>
+                      <div style={{ flex: 1, height: 6, borderRadius: 99, background: "rgba(255,255,255,0.06)", overflow: "hidden", maxWidth: 30 }}>
+                        <div style={{ width: `${(row.free / 5) * 100}%`, height: "100%", background: row.free === 5 ? C.free : C.cyan, transition: "width .3s" }} />
+                      </div>
+                      <span style={{ fontSize: 12, color: row.free === 5 ? C.free : C.dim, fontWeight: 700, minWidth: 10 }}>{row.free}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </Panel>
+    </>
+  );
+}
+
+function Empty({ icon, title, sub }) {
+  return <div style={{ textAlign: "center", padding: "30px 10px", color: C.dim }}><div style={{ marginBottom: 10, display: "flex", justifyContent: "center" }}>{icon}</div><div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, letterSpacing: 1, color: C.text }}>{title}</div><div style={{ fontSize: 12, color: C.faint, marginTop: 4, maxWidth: 360, margin: "4px auto 0" }}>{sub}</div></div>;
+}
+
+function FullHouseBanner({ days, goChat }) {
+  const soonest = days[0]; const dt = new Date(soonest.y, soonest.m, soonest.d);
+  const when = `${WD_LONG[soonest.wd]}, ${dt.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" })}`;
+  const extra = days.length - 1;
+  return (
+    <div style={{ position: "relative", overflow: "hidden", borderRadius: 16, padding: "18px 20px", marginBottom: 14, background: `linear-gradient(105deg, ${hexA(C.free, 0.22)}, ${hexA(C.cyan, 0.14)})`, border: `1px solid ${C.free}`, boxShadow: `0 0 34px ${hexA(C.free, 0.35)}`, animation: "nfpFadeUp .5s ease both" }}>
+      <div style={{ position: "absolute", top: -30, right: -10, width: 160, height: 160, borderRadius: "50%", background: `radial-gradient(circle, ${hexA(C.free, 0.35)}, transparent 70%)`, filter: "blur(10px)", animation: "nfpPulse 3s ease-in-out infinite", pointerEvents: "none" }} />
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", position: "relative" }}>
+        <span style={{ fontSize: 28 }}>🎉</span>
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 30, letterSpacing: 2, lineHeight: 1, color: C.free }}>FULL HOUSE DETECTED</div>
+          <div style={{ fontSize: 13, color: C.text, marginTop: 4 }}>All five cats are free on <b>{when}</b>{extra > 0 && <span style={{ color: hexA(C.text, 0.7) }}> · +{extra} more day{extra > 1 ? "s" : ""} this year</span>}</div>
+          <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>{USERS.map((u) => <span key={u.id} title={u.name} style={{ fontSize: 15, width: 28, height: 28, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", background: hexA(u.accent, 0.18), border: `1px solid ${hexA(u.accent, 0.55)}` }}>{u.emoji}</span>)}</div>
+        </div>
+        {goChat && <button className="nfp-btn" onClick={goChat} style={{ cursor: "pointer", border: "none", borderRadius: 11, padding: "11px 16px", fontFamily: "'Bebas Neue', sans-serif", fontSize: 18, letterSpacing: 1.5, color: "#04130b", background: C.free, boxShadow: `0 4px 18px ${hexA(C.free, 0.5)}`, whiteSpace: "nowrap" }}>LOCK IT IN →</button>}
+      </div>
+    </div>
+  );
+}
+
+function Chat({ me, feed, chatInput, setChatInput, sendChat, scrollRef }) {
+  const uOf = (id) => USERS.find((x) => x.id === id) || { name: id, emoji: "❔", accent: C.dim };
+  const fmtTime = (ts) => {
+    const d = new Date(ts); const sameDay = d.toDateString() === new Date().toDateString();
+    const t = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    return sameDay ? t : `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${t}`;
+  };
+  return (
+    <Panel style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column", height: "62vh", minHeight: 420 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 16px", borderBottom: `1px solid ${C.border}` }}>
+        <Icon name="radio" size={15} color={C.magenta} /><span style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, letterSpacing: 2 }}>TRANSMISSIONS</span>
+        <span style={{ fontSize: 11, color: C.faint, marginLeft: "auto" }}>open channel · {feed.length} msgs</span>
+      </div>
+      <div ref={scrollRef} className="nfp-scroll" style={{ flex: 1, overflowY: "auto", padding: "14px 14px 6px" }}>
+        {feed.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "50px 16px", color: C.faint }}>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}><Icon name="message" size={30} color={C.faint} /></div>
+            <div style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 22, letterSpacing: 1, color: C.text }}>channel's quiet</div>
+            <div style={{ fontSize: 12, marginTop: 4 }}>say something before the heat death of the universe.</div>
+          </div>
+        ) : feed.map((m, i) => {
+          const u = uOf(m.uid); const mine = m.uid === me; const prev = feed[i - 1];
+          const grouped = prev && prev.uid === m.uid && m.ts - prev.ts < 240000;
+          return (
+            <div key={m.id} style={{ display: "flex", flexDirection: mine ? "row-reverse" : "row", gap: 8, marginTop: grouped ? 3 : 12 }}>
+              <div style={{ width: 30, flexShrink: 0, textAlign: "center" }}>{!grouped && <span style={{ fontSize: 15, width: 30, height: 30, borderRadius: 9, display: "inline-flex", alignItems: "center", justifyContent: "center", background: hexA(u.accent, 0.15), border: `1px solid ${hexA(u.accent, 0.5)}` }}>{u.emoji}</span>}</div>
+              <div style={{ maxWidth: "76%", display: "flex", flexDirection: "column", alignItems: mine ? "flex-end" : "flex-start" }}>
+                {!grouped && <div style={{ fontSize: 11, color: u.accent, fontWeight: 700, marginBottom: 3, padding: "0 4px" }}>{mine ? "you" : u.name}<span style={{ color: C.faint, fontWeight: 400, marginLeft: 6 }}>{fmtTime(m.ts)}</span></div>}
+                <div style={{ fontSize: 13.5, lineHeight: 1.45, color: C.text, padding: "9px 13px", borderRadius: 13, borderTopLeftRadius: mine ? 13 : grouped ? 13 : 3, borderTopRightRadius: mine ? (grouped ? 13 : 3) : 13, background: mine ? hexA(u.accent, 0.16) : "rgba(255,255,255,0.045)", border: `1px solid ${mine ? hexA(u.accent, 0.4) : C.border}`, wordBreak: "break-word", whiteSpace: "pre-wrap" }}>{m.text}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 8, padding: 12, borderTop: `1px solid ${C.border}` }}>
+        <input value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } }} placeholder="transmit to the squad…" maxLength={280}
+          style={{ flex: 1, padding: "11px 14px", borderRadius: 11, background: "rgba(0,0,0,0.32)", border: `1px solid ${C.border}`, color: C.text, fontSize: 13.5, outline: "none" }} />
+        <button className="nfp-btn" onClick={sendChat} disabled={!chatInput.trim()} title="send" style={{ width: 48, borderRadius: 11, border: "none", cursor: chatInput.trim() ? "pointer" : "default", color: "#070711", background: chatInput.trim() ? `linear-gradient(95deg, ${C.cyan}, ${C.free})` : C.panel2, display: "flex", alignItems: "center", justifyContent: "center", opacity: chatInput.trim() ? 1 : 0.5 }}><Icon name="send" size={17} /></button>
+      </div>
+    </Panel>
+  );
+}
+
+function Crew({ me, allData }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: 12 }}>
+      {USERS.map((u, i) => {
+        const d = allData[u.id] || { days: {}, vibe: "", updatedAt: 0 };
+        const free = Object.values(d.days).filter((s) => s === "free").length;
+        const busy = Object.values(d.days).filter((s) => s === "busy").length;
+        const active = Object.keys(d.days).length > 0 || (d.vibe || "").trim();
+        const isMe = u.id === me;
+        return (
+          <div key={u.id} style={{ background: C.panel, border: `1px solid ${isMe ? hexA(u.accent, 0.5) : C.border}`, borderRadius: 16, padding: 16, backdropFilter: "blur(8px)", boxShadow: isMe ? `0 0 22px ${hexA(u.accent, 0.18)}` : "none", animation: "nfpFadeUp .4s ease both", animationDelay: `${i * 60}ms` }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 26, width: 46, height: 46, borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", background: hexA(u.accent, 0.14), border: `1px solid ${hexA(u.accent, 0.45)}` }}>{u.emoji}</span>
+                <div>
+                  <div style={{ fontWeight: 700, color: u.accent, fontSize: 15, lineHeight: 1.1 }}>{u.name}</div>
+                  <div style={{ fontSize: 10, color: active ? C.free : C.faint, letterSpacing: 1, marginTop: 2 }}>{active ? "● ONLINE" : "○ RADIO SILENCE"}</div>
+                </div>
+              </div>
+              {isMe && <span style={{ fontSize: 9, color: u.accent, border: `1px solid ${hexA(u.accent, 0.5)}`, borderRadius: 6, padding: "2px 6px", letterSpacing: 1 }}>YOU</span>}
+            </div>
+            <p style={{ fontSize: 12, color: C.dim, lineHeight: 1.5, margin: "12px 0 10px", minHeight: 34 }}>{u.blurb}</p>
+            {(d.vibe || "").trim() ? (
+              <div style={{ fontSize: 12, color: C.text, background: "rgba(0,0,0,0.28)", borderLeft: `2px solid ${u.accent}`, padding: "7px 10px", borderRadius: 6, marginBottom: 12 }}>“{d.vibe}”</div>
+            ) : (
+              <div style={{ fontSize: 11, color: C.faint, fontStyle: "italic", marginBottom: 12 }}>no vibe broadcasted yet</div>
+            )}
+            <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+              <span style={{ fontSize: 12, color: C.free }}><b style={{ fontSize: 16 }}>{free}</b> free</span>
+              <span style={{ fontSize: 12, color: C.busy }}><b style={{ fontSize: 16 }}>{busy}</b> busy</span>
+              <span style={{ fontSize: 11, color: C.faint, marginLeft: "auto" }}>{relTime(d.updatedAt)}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Ticker() {
+  const line = JOKES.join("   ✦   ");
+  return (
+    <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 8, height: 34, background: "rgba(8,7,18,0.9)", borderTop: `1px solid ${C.border}`, display: "flex", alignItems: "center", overflow: "hidden", backdropFilter: "blur(6px)" }}>
+      <div style={{ display: "flex", whiteSpace: "nowrap", animation: "nfpMarquee 55s linear infinite" }}>
+        <span style={{ fontSize: 12, color: C.dim, paddingRight: 40 }}>{line}   ✦   </span>
+        <span style={{ fontSize: 12, color: C.dim, paddingRight: 40 }}>{line}   ✦   </span>
+      </div>
+    </div>
+  );
+}
+
+const navBtn = (disabled) => ({ width: 40, height: 40, borderRadius: 11, cursor: disabled ? "default" : "pointer", color: disabled ? C.faint : C.text, background: C.panel2, border: `1px solid ${C.border}`, opacity: disabled ? 0.4 : 1, display: "flex", alignItems: "center", justifyContent: "center" });
+
+ReactDOM.createRoot(document.getElementById("root")).render(<NFP />);
+</script>
+</body>
+</html>
